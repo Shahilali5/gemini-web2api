@@ -6,13 +6,13 @@
     Third-Party Inference Gateway feature.
 .EXAMPLE
     .\connect-claudedesktop.ps1
-    .\connect-claudedesktop.ps1 -ServerUrl "http://YOUR_VPS_IP:8081"
+    .\connect-claudedesktop.ps1 -ServerUrl "http://16.192.188.167:8081"
     .\connect-claudedesktop.ps1 -Restore
 #>
 
 [CmdletBinding()]
 param(
-    [string]$ServerUrl = "http://localhost:8081",
+    [string]$ServerUrl = "http://16.192.188.167:8081",
     [string]$ApiKey = "sk-gemini",
     [switch]$Restore
 )
@@ -35,13 +35,13 @@ if ($Restore) {
     return
 }
 
-# 1. Health check the local server
+# 1. Health check the server
 try {
-    $resp = Invoke-RestMethod -Uri "$ServerUrl/" -Method Get -TimeoutSec 2 -ErrorAction Stop
+    $resp = Invoke-RestMethod -Uri "$ServerUrl/" -Method Get -TimeoutSec 3 -ErrorAction Stop
     Write-Host "[OK] Server is reachable at $ServerUrl" -ForegroundColor Green
 } catch {
     Write-Host "[WARN] Could not reach server at $ServerUrl" -ForegroundColor Yellow
-    Write-Host "       Make sure your proxy is running: python gemini_web2api.py" -ForegroundColor Yellow
+    Write-Host "       Check if port 8081 is open in your VPS Firewall / Security Group." -ForegroundColor Yellow
 }
 
 # 2. Write registry policy
@@ -53,7 +53,7 @@ Set-ItemProperty -Path $RegPath -Name "inferenceProvider" -Value "gateway" -Type
 Set-ItemProperty -Path $RegPath -Name "inferenceGatewayBaseUrl" -Value $ServerUrl -Type String
 Set-ItemProperty -Path $RegPath -Name "inferenceGatewayApiKey" -Value $ApiKey -Type String
 
-Write-Host "`n[SUCCESS] Claude Desktop is now configured to use gemini-web2api!" -ForegroundColor Green
+Write-Host "`n[SUCCESS] Claude Desktop is now configured to use: $ServerUrl" -ForegroundColor Green
 Write-Host "  Gateway Base URL: $ServerUrl" -ForegroundColor White
 Write-Host "  Auth Key:         $ApiKey" -ForegroundColor White
 Write-Host "`nPlease restart Claude Desktop to start chatting." -ForegroundColor Cyan
