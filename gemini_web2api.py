@@ -56,7 +56,7 @@ DEFAULT_CONFIG = {
     "gemini_bl": "boq_assistant-bard-web-server_20260716.08_p0",
     "auth_user": None,
     "xsrf_token": None,
-    "default_model": "gemini-3.6-flash",
+    "default_model": "gemini-3.7-flash",
     "log_requests": True,
     "cookie_file": None,
     "proxy": None,
@@ -102,6 +102,90 @@ MODELS = {
     "gemini-flash-lite": {
         "mode": 6, "think": 4,
         "desc": "Lightweight fast model",
+    },
+    "claude-opus-4-6": {
+        "mode": 2, "think": 0,
+        "desc": "Claude Opus 4.6 (routed to Gemini 3.5 Flash Thinking)",
+    },
+    "claude-sonnet-4-6": {
+        "mode": 1, "think": 4,
+        "desc": "Claude Sonnet 4.6 (routed to Gemini 3.7 Flash)",
+    },
+    "claude-3-7-sonnet-20250219": {
+        "mode": 1, "think": 4,
+        "desc": "Claude 3.7 Sonnet (routed to Gemini 3.7 Flash)",
+    },
+    "claude-3-5-sonnet-20241022": {
+        "mode": 1, "think": 4,
+        "desc": "Claude 3.5 Sonnet (routed to Gemini 3.7 Flash)",
+    },
+    "claude-3-7-sonnet-latest": {
+        "mode": 1, "think": 4,
+        "desc": "Claude 3.7 Sonnet Latest (routed to Gemini 3.7 Flash)",
+    },
+    "claude-3-5-sonnet-latest": {
+        "mode": 1, "think": 4,
+        "desc": "Claude 3.5 Sonnet Latest (routed to Gemini 3.7 Flash)",
+    },
+    "claude-3-5-haiku-latest": {
+        "mode": 1, "think": 4,
+        "desc": "Claude 3.5 Haiku Latest (routed to Gemini 3.6 Flash)",
+    },
+    "claude-3-haiku-20240307": {
+        "mode": 6, "think": 4,
+        "desc": "Claude 3 Haiku (routed to Gemini Flash Lite)",
+    },
+    "claude-3-opus-20240229": {
+        "mode": 2, "think": 0,
+        "desc": "Claude 3 Opus (routed to Gemini 3.5 Flash Thinking)",
+    },
+    "claude-3-opus-latest": {
+        "mode": 2, "think": 0,
+        "desc": "Claude 3 Opus Latest (routed to Gemini 3.5 Flash Thinking)",
+    },
+    "gpt-4o": {
+        "mode": 1, "think": 4,
+        "desc": "GPT-4o (routed to Gemini 3.7 Flash)",
+    },
+    "gpt-4o-mini": {
+        "mode": 1, "think": 4,
+        "desc": "GPT-4o mini (routed to Gemini 3.6 Flash)",
+    },
+    "gpt-4-turbo": {
+        "mode": 1, "think": 4,
+        "desc": "GPT-4 Turbo (routed to Gemini 3.7 Flash)",
+    },
+    "gpt-4": {
+        "mode": 1, "think": 4,
+        "desc": "GPT-4 (routed to Gemini 3.7 Flash)",
+    },
+    "o1": {
+        "mode": 2, "think": 0,
+        "desc": "o1 reasoning model (routed to Gemini 3.5 Flash Thinking)",
+    },
+    "o1-preview": {
+        "mode": 2, "think": 0,
+        "desc": "o1-preview (routed to Gemini 3.5 Flash Thinking)",
+    },
+    "o1-mini": {
+        "mode": 5, "think": 0,
+        "desc": "o1-mini (routed to Gemini 3.5 Flash Thinking Lite)",
+    },
+    "o3-mini": {
+        "mode": 2, "think": 0,
+        "desc": "o3-mini reasoning model (routed to Gemini 3.5 Flash Thinking)",
+    },
+    "codex": {
+        "mode": 1, "think": 4,
+        "desc": "OpenAI Codex CLI model (routed to Gemini 3.7 Flash)",
+    },
+    "code-davinci-002": {
+        "mode": 1, "think": 4,
+        "desc": "Code Davinci 002 (routed to Gemini 3.7 Flash)",
+    },
+    "claude-3-5-haiku-20241022": {
+        "mode": 1, "think": 4,
+        "desc": "Claude 3.5 Haiku (routed to Gemini 3.6 Flash)",
     },
 }
 
@@ -636,6 +720,124 @@ def parse_tool_calls(text: str) -> tuple:
     return clean, tool_calls
 
 
+def anthropic_to_prompt(req: dict) -> tuple:
+    """Convert Anthropic Messages API request to (prompt_str, images_list)."""
+    parts = []
+    images = []
+
+    # System instruction
+    system = req.get("system")
+    if system:
+        if isinstance(system, list):
+            sys_text = " ".join(
+                item.get("text", "") if isinstance(item, dict) else str(item)
+                for item in system
+            ).strip()
+        else:
+            sys_text = str(system).strip()
+        if sys_text:
+            parts.append(f"[System instruction]: {sys_text}")
+
+    # Tools
+    tools = req.get("tools")
+    if tools:
+        tool_defs = []
+        for tool in tools:
+            schema = tool.get("input_schema") or tool.get("parameters") or {}
+            tool_defs.append({
+                "name": tool.get("name", ""),
+                "description": tool.get("description", ""),
+                "parameters": schema,
+            })
+        if tool_defs:
+            tools_json = json.dumps(tool_defs, indent=2)
+            if len(tools_json) > PROMPT_MAX_BYTES // 2:
+                slim_defs = [{"name": t["name"], "description": t["description"]} for t in tool_defs]
+                tools_json = json.dumps(slim_defs, indent=2)
+                log(f"Anthropic tools block too large ({len(tool_defs)} tools), stripped parameters")
+            parts.append(
+                "[System instruction]: You have access to tools. "
+                "To call a tool, respond ONLY with a tool_call block in this format:\n"
+                '```tool_call\n{"name": "func_name", "arguments": {...}}\n```\n'
+                "Only use tool_call blocks when needed.\n\n"
+                f"Available tools:\n{tools_json}"
+            )
+
+    # Messages
+    for msg in req.get("messages", []):
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+        tc_strs = []
+        text_parts = []
+
+        if isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict):
+                    text_parts.append(str(block))
+                    continue
+                btype = block.get("type", "")
+                if btype == "text":
+                    text_parts.append(block.get("text", ""))
+                elif btype == "tool_use":
+                    name = block.get("name", "")
+                    inp = block.get("input", {})
+                    tc_strs.append(
+                        f'```tool_call\n{{"name": "{name}", "arguments": {json.dumps(inp, ensure_ascii=False)}}}\n```'
+                    )
+                elif btype == "tool_result":
+                    tool_id = block.get("tool_use_id", "")
+                    res_content = block.get("content", "")
+                    if isinstance(res_content, list):
+                        res_texts = []
+                        for sub in res_content:
+                            if isinstance(sub, dict):
+                                if sub.get("type") == "text":
+                                    res_texts.append(sub.get("text", ""))
+                                elif sub.get("type") == "image":
+                                    src = sub.get("source", {})
+                                    if src.get("type") == "base64" and src.get("data"):
+                                        try:
+                                            raw = base64.b64decode(src["data"], validate=True)
+                                            images.append((raw, src.get("media_type", "image/png")))
+                                            res_texts.append("[Image attached]")
+                                        except Exception:
+                                            pass
+                            else:
+                                res_texts.append(str(sub))
+                        res_str = " ".join(res_texts)
+                    else:
+                        res_str = str(res_content)
+                    text_parts.append(f"[Tool result for {tool_id}]: {res_str}")
+                elif btype == "image":
+                    src = block.get("source", {})
+                    if src.get("type") == "base64" and src.get("data"):
+                        try:
+                            raw = base64.b64decode(src["data"], validate=True)
+                            images.append((raw, src.get("media_type", "image/png")))
+                            text_parts.append("[Image attached]")
+                        except Exception:
+                            pass
+                elif btype == "thinking":
+                    th = block.get("thinking", "")
+                    if th:
+                        text_parts.append(f"[Thinking]: {th}")
+            body_text = " ".join(t for t in text_parts if t)
+        else:
+            body_text = str(content) if content else ""
+
+        if role == "assistant":
+            msg_str = f"[Assistant]: {body_text}" if body_text else "[Assistant]"
+            if tc_strs:
+                msg_str += "\n" + "\n".join(tc_strs)
+            parts.append(msg_str)
+        elif role == "user":
+            parts.append(body_text if body_text else "")
+        else:
+            parts.append(f"[{role}]: {body_text}")
+
+    return "\n\n".join(p for p in parts if p), images
+
+
 # ─── HTTP Handler ────────────────────────────────────────────────────────────
 
 class GeminiHandler(BaseHTTPRequestHandler):
@@ -651,6 +853,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+        self.wfile.flush()
 
     def _authorized(self):
         keys = CONFIG.get("api_keys") or []
@@ -674,24 +877,34 @@ class GeminiHandler(BaseHTTPRequestHandler):
     def do_OPTIONS(self):
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS, HEAD")
         self.send_header("Access-Control-Allow-Headers", "*")
         self.end_headers()
+        self.wfile.flush()
+
+    def do_HEAD(self):
+        self.send_response(200)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS, HEAD")
+        self.send_header("Access-Control-Allow-Headers", "*")
+        self.end_headers()
+        self.wfile.flush()
 
     def do_GET(self):
         try:
-            if self.path.startswith("/v1") and not self._authorized():
+            path = self.path.split("?")[0].rstrip("/")
+            if (path.startswith("/v1") or path.startswith("/models") or path.startswith("/messages")) and not self._authorized():
                 self.send_json({"error": {"message": "invalid api key"}}, 401)
                 return
-            if self.path == "/v1/models":
+            if path in ("/v1/models", "/models", "/v1/v1/models"):
                 self.send_json({"object": "list", "data": [
                     {"id": n, "object": "model", "created": 1700000000,
                      "owned_by": "google", "description": c["desc"]}
                     for n, c in MODELS.items()
                 ]})
-            elif self.path.startswith("/v1beta/models"):
+            elif path.startswith("/v1beta/models"):
                 self._handle_google_models_list()
-            elif self.path == "/":
+            elif path in ("", "/", "/api/hello", "/health"):
                 self.send_json({"status": "ok", "version": __version__,
                                 "models": list(MODELS.keys())})
             else:
@@ -703,17 +916,22 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         try:
-            if self.path.startswith("/v1") and not self._authorized():
+            path = self.path.split("?")[0].rstrip("/")
+            if (path.startswith("/v1") or path.startswith("/messages") or path.startswith("/chat") or path.startswith("/responses")) and not self._authorized():
                 self.send_json({"error": {"message": "invalid api key"}}, 401)
                 return
             body = self._read_request_body()
-            if self.path == "/v1/chat/completions":
+            if path in ("/v1/chat/completions", "/chat/completions", "/v1/v1/chat/completions") or path.endswith("/chat/completions"):
                 self.handle_chat(body)
-            elif self.path == "/v1/responses":
+            elif path in ("/v1/responses", "/responses", "/v1/v1/responses") or path.endswith("/responses"):
                 self.handle_responses(body)
-            elif ":streamGenerateContent" in self.path:
+            elif path in ("/v1/messages", "/messages", "/v1/v1/messages") or (path.endswith("/messages") and not path.endswith("/count_tokens")):
+                self.handle_messages(body)
+            elif path in ("/v1/messages/count_tokens", "/messages/count_tokens", "/v1/v1/messages/count_tokens") or path.endswith("/messages/count_tokens"):
+                self.handle_count_tokens(body)
+            elif ":streamGenerateContent" in path:
                 self._handle_google_generate(body, stream=True)
-            elif ":generateContent" in self.path:
+            elif ":generateContent" in path:
                 self._handle_google_generate(body, stream=False)
             else:
                 self.send_json({"error": "not found"}, 404)
@@ -754,13 +972,62 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
     def _resolve_model(self, model_name):
         think_override = None
+        if not model_name:
+            model_name = CONFIG.get("default_model", "gemini-3.6-flash")
         if "@think=" in model_name:
             model_name, think_str = model_name.rsplit("@think=", 1)
-            think_override = int(think_str)
-        cfg = MODELS.get(model_name)
+            try:
+                think_override = int(think_str)
+            except ValueError:
+                pass
+        alias_map = {
+            # Claude aliases
+            "claude-opus-4-6": "gemini-3.5-flash-thinking",
+            "claude-sonnet-4-6": "gemini-3.7-flash",
+            "claude-3-7-sonnet-20250219": "gemini-3.7-flash",
+            "claude-3-7-sonnet-latest": "gemini-3.7-flash",
+            "claude-3-5-sonnet-20241022": "gemini-3.7-flash",
+            "claude-3-5-sonnet-latest": "gemini-3.7-flash",
+            "claude-3-5-haiku-20241022": "gemini-3.6-flash",
+            "claude-3-5-haiku-latest": "gemini-3.6-flash",
+            "claude-3-haiku-20240307": "gemini-flash-lite",
+            "claude-3-opus-20240229": "gemini-3.5-flash-thinking",
+            "claude-3-opus-latest": "gemini-3.5-flash-thinking",
+            # OpenAI / Codex aliases
+            "gpt-4o": "gemini-3.7-flash",
+            "gpt-4o-mini": "gemini-3.6-flash",
+            "gpt-4-turbo": "gemini-3.7-flash",
+            "gpt-4": "gemini-3.7-flash",
+            "o1": "gemini-3.5-flash-thinking",
+            "o1-preview": "gemini-3.5-flash-thinking",
+            "o1-mini": "gemini-3.5-flash-thinking-lite",
+            "o3-mini": "gemini-3.5-flash-thinking",
+            "codex": "gemini-3.7-flash",
+            "code-davinci-002": "gemini-3.7-flash",
+            "openai/codex": "gemini-3.7-flash",
+            "claude-sonnet-4-6": "gemini-3.7-flash",
+            "claude-3-7-sonnet-20250219": "gemini-3.7-flash",
+            "claude-3-5-sonnet-20241022": "gemini-3.7-flash",
+            "claude-3-5-haiku-20241022": "gemini-3.6-flash",
+            "claude-3-haiku-20240307": "gemini-flash-lite",
+            "claude-3-opus-20240229": "gemini-3.5-flash-thinking",
+        }
+        target = alias_map.get(model_name, model_name)
+        cfg = MODELS.get(target)
+        if not cfg:
+            lower = model_name.lower()
+            if "o1" in lower or "o3" in lower or "thinking" in lower or "reason" in lower:
+                target = "gemini-3.5-flash-thinking"
+                cfg = MODELS.get(target)
+            elif "claude" in lower or "gpt-4" in lower or "codex" in lower:
+                target = "gemini-3.7-flash" if "gemini-3.7-flash" in MODELS else CONFIG.get("default_model", "gemini-3.6-flash")
+                cfg = MODELS.get(target)
+            else:
+                target = CONFIG.get("default_model", "gemini-3.6-flash")
+                cfg = MODELS.get(target)
         if not cfg:
             return None, None, None, f"Unknown model: {model_name}"
-        return model_name, cfg["mode"], (think_override if think_override is not None else cfg["think"]), None
+        return target, cfg["mode"], (think_override if think_override is not None else cfg["think"]), None
 
     def _call_gemini(self, prompt, model_id, think_mode, tools, file_refs=None):
         raw = gemini_stream_generate(prompt, model_id, think_mode, file_refs)
@@ -875,7 +1142,11 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 if isinstance(item, str):
                     messages.append({"role": "user", "content": item})
                 elif isinstance(item, dict):
-                    if item.get("type") == "function_call_output":
+                    if item.get("type") == "function_call":
+                        messages.append({"role": "assistant", "content": None,
+                                         "tool_calls": [{"id": item.get("call_id", item.get("id", "call_0")), "type": "function",
+                                                         "function": {"name": item.get("name", ""), "arguments": item.get("arguments", "{}")}}]})
+                    elif item.get("type") == "function_call_output":
                         messages.append({"role": "tool", "tool_call_id": item.get("call_id", ""),
                                          "name": item.get("name", ""), "content": item.get("output", "")})
                     elif item.get("type") in ("input_text", "input_image", "image"):
@@ -968,6 +1239,195 @@ class GeminiHandler(BaseHTTPRequestHandler):
             self.send_json({"id": rid, "object": "response", "created_at": int(time.time()), "status": "completed",
                             "model": model_name, "output": output,
                             "usage": {"input_tokens": len(prompt)//4, "output_tokens": len(text)//4, "total_tokens": (len(prompt)+len(text))//4}})
+
+
+    # ─── Anthropic Messages API (Claude Code compatible) ─────────────────────
+
+    def handle_count_tokens(self, body: bytes):
+        try:
+            req = json.loads(body)
+            prompt, _ = anthropic_to_prompt(req)
+            tokens = max(1, len(prompt) // 4)
+            self.send_json({"input_tokens": tokens})
+        except Exception:
+            self.send_json({"input_tokens": 100})
+
+    def handle_messages(self, body: bytes):
+        req = json.loads(body)
+        raw_model = req.get("model", CONFIG.get("default_model", "gemini-3.6-flash"))
+        model_name, model_id, think_mode, err = self._resolve_model(raw_model)
+        if err:
+            model_name, model_id, think_mode, _ = self._resolve_model(CONFIG.get("default_model", "gemini-3.6-flash"))
+
+        tools = req.get("tools")
+        prompt, images = anthropic_to_prompt(req)
+        if not prompt.strip():
+            self.send_json({"type": "error", "error": {"type": "invalid_request_error", "message": "empty prompt"}}, 400)
+            return
+
+        stream = req.get("stream", False)
+        msg_id = f"msg_{uuid.uuid4().hex[:24]}"
+        try:
+            file_refs = upload_images(images)
+        except RuntimeError as e:
+            self.send_json({"type": "error", "error": {"type": "api_error", "message": f"upstream error: {e}"}}, 502)
+            return
+
+        input_tokens = max(1, len(prompt) // 4)
+
+        if stream and not tools:
+            # Streaming without tools
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("anthropic-version", "2023-06-01")
+                self.end_headers()
+
+                start_evt = {
+                    "type": "message_start",
+                    "message": {
+                        "id": msg_id,
+                        "type": "message",
+                        "role": "assistant",
+                        "model": raw_model,
+                        "content": [],
+                        "stop_reason": None,
+                        "stop_sequence": None,
+                        "usage": {"input_tokens": input_tokens, "output_tokens": 1},
+                    },
+                }
+                self.wfile.write(f"event: message_start\ndata: {json.dumps(start_evt)}\n\n".encode())
+
+                block_start = {
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {"type": "text", "text": ""},
+                }
+                self.wfile.write(f"event: content_block_start\ndata: {json.dumps(block_start)}\n\n".encode())
+                self.wfile.flush()
+
+                output_tokens = 0
+                for delta_text in gemini_stream_generate_iter(prompt, model_id, think_mode, file_refs):
+                    output_tokens += max(1, len(delta_text) // 4)
+                    chunk = {
+                        "type": "content_block_delta",
+                        "index": 0,
+                        "delta": {"type": "text_delta", "text": delta_text},
+                    }
+                    self.wfile.write(f"event: content_block_delta\ndata: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
+                    self.wfile.flush()
+
+                block_stop = {"type": "content_block_stop", "index": 0}
+                self.wfile.write(f"event: content_block_stop\ndata: {json.dumps(block_stop)}\n\n".encode())
+
+                msg_delta = {
+                    "type": "message_delta",
+                    "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                    "usage": {"output_tokens": max(1, output_tokens)},
+                }
+                self.wfile.write(f"event: message_delta\ndata: {json.dumps(msg_delta)}\n\n".encode())
+                self.wfile.write(b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            except Exception as e:
+                log(f"Anthropic stream error: {e}")
+            return
+
+        # With tools or non-streaming
+        try:
+            text, tool_calls = self._call_gemini(prompt, model_id, think_mode, tools, file_refs)
+        except Exception as e:
+            self.send_json({"type": "error", "error": {"type": "api_error", "message": f"upstream error: {e}"}}, 502)
+            return
+
+        content_blocks = []
+        if text:
+            content_blocks.append({"type": "text", "text": text})
+
+        if tool_calls:
+            for tc in tool_calls:
+                fn = tc.get("function", {})
+                tool_name = fn.get("name", "")
+                try:
+                    tool_args = json.loads(fn.get("arguments", "{}"))
+                except Exception:
+                    tool_args = {}
+                call_id = tc.get("id", f"toolu_{uuid.uuid4().hex[:16]}")
+                if not call_id.startswith("toolu_"):
+                    call_id = f"toolu_{call_id.replace('call_', '')}"
+                content_blocks.append({
+                    "type": "tool_use",
+                    "id": call_id,
+                    "name": tool_name,
+                    "input": tool_args,
+                })
+
+        stop_reason = "tool_use" if tool_calls else "end_turn"
+        output_tokens = max(1, len(text or "") // 4 + len(tool_calls or []) * 20)
+
+        if stream:
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("anthropic-version", "2023-06-01")
+                self.end_headers()
+
+                start_evt = {
+                    "type": "message_start",
+                    "message": {
+                        "id": msg_id,
+                        "type": "message",
+                        "role": "assistant",
+                        "model": raw_model,
+                        "content": [],
+                        "stop_reason": None,
+                        "stop_sequence": None,
+                        "usage": {"input_tokens": input_tokens, "output_tokens": 1},
+                    },
+                }
+                self.wfile.write(f"event: message_start\ndata: {json.dumps(start_evt)}\n\n".encode())
+
+                for idx, blk in enumerate(content_blocks):
+                    if blk["type"] == "text":
+                        self.wfile.write(f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': idx, 'content_block': {'type': 'text', 'text': ''}})}\n\n".encode())
+                        self.wfile.write(f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': idx, 'delta': {'type': 'text_delta', 'text': blk['text']}}, ensure_ascii=False)}\n\n".encode())
+                        self.wfile.write(f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': idx})}\n\n".encode())
+                    elif blk["type"] == "tool_use":
+                        self.wfile.write(f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': idx, 'content_block': {'type': 'tool_use', 'id': blk['id'], 'name': blk['name'], 'input': {}}})}\n\n".encode())
+                        self.wfile.write(f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': idx, 'delta': {'type': 'input_json_delta', 'partial_json': json.dumps(blk['input'], ensure_ascii=False)}}, ensure_ascii=False)}\n\n".encode())
+                        self.wfile.write(f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': idx})}\n\n".encode())
+
+                msg_delta = {
+                    "type": "message_delta",
+                    "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+                    "usage": {"output_tokens": output_tokens},
+                }
+                self.wfile.write(f"event: message_delta\ndata: {json.dumps(msg_delta)}\n\n".encode())
+                self.wfile.write(b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            except Exception as e:
+                log(f"Anthropic stream error: {e}")
+        else:
+            self.send_json({
+                "id": msg_id,
+                "type": "message",
+                "role": "assistant",
+                "model": raw_model,
+                "content": content_blocks,
+                "stop_reason": stop_reason,
+                "stop_sequence": None,
+                "usage": {
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                },
+            })
 
 
     # ─── Google Native API (Gemini CLI compatible) ────────────────────────────
@@ -1083,7 +1543,7 @@ def main():
 
     class ThreadedServer(ThreadingMixIn, HTTPServer):
         daemon_threads = True
-        allow_reuse_address = True
+        allow_reuse_address = False
 
     port = CONFIG["port"]
     server = ThreadedServer((CONFIG["host"], port), GeminiHandler)
@@ -1096,7 +1556,7 @@ def main():
     print(f"  Retry:     {CONFIG['retry_attempts']}x / {CONFIG['retry_delay_sec']}s")
     print(f"  BL:        {CONFIG['gemini_bl']}")
     print(f"  Temporary: {'yes' if CONFIG.get('temporary_chats', False) else 'no'}")
-    print()
+    print(flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

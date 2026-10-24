@@ -1,4 +1,4 @@
-"""HTTP server: OpenAI-compatible API endpoints."""
+"""HTTP server: OpenAI, Anthropic (Claude Code), Codex, and Google Gemini API endpoints."""
 import json
 import time
 import uuid
@@ -9,7 +9,13 @@ from socketserver import ThreadingMixIn
 from .config import CONFIG
 from .models import MODELS, resolve_model
 from .gemini import generate, generate_stream, log
-from .tools import messages_to_prompt, parse_tool_calls, google_contents_to_prompt, parse_google_function_calls
+from .tools import (
+    messages_to_prompt,
+    parse_tool_calls,
+    google_contents_to_prompt,
+    parse_google_function_calls,
+    anthropic_to_prompt,
+)
 from .multimodal import detect_image_mime, fetch_image_bytes, upload_image
 from . import __version__
 
@@ -56,13 +62,18 @@ class GeminiHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+        self.wfile.flush()
 
-    def _start_sse(self):
+    def _start_sse(self, extra_headers=None):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Access-Control-Allow-Origin", "*")
+        if extra_headers:
+            for k, v in extra_headers.items():
+                self.send_header(k, v)
         self.end_headers()
+        self.wfile.flush()
 
     def _parse_body(self, body: bytes) -> dict:
         try:
@@ -118,47 +129,65 @@ class GeminiHandler(BaseHTTPRequestHandler):
     def do_OPTIONS(self):
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS, HEAD")
         self.send_header("Access-Control-Allow-Headers", "*")
         self.end_headers()
+        self.wfile.flush()
+
+    def do_HEAD(self):
+        self.send_response(200)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS, HEAD")
+        self.send_header("Access-Control-Allow-Headers", "*")
+        self.end_headers()
+        self.wfile.flush()
 
     def do_GET(self):
         try:
-            if self.path.startswith("/v1") and not self._authorized():
+            path = self.path.split("?")[0].rstrip("/")
+            if (path.startswith("/v1") or path.startswith("/models") or path.startswith("/messages")) and not self._authorized():
                 self.send_json({"error": {"message": "invalid api key"}}, 401)
                 return
-            if self.path == "/v1/models":
+            if path in ("/v1/models", "/models", "/v1/v1/models"):
                 self.send_json({"object": "list", "data": [
                     {"id": n, "object": "model", "created": 1700000000,
                      "owned_by": "google", "description": c["desc"]}
                     for n, c in MODELS.items()
                 ]})
-            elif self.path.startswith("/v1beta/models"):
-                self.send_json({"models": [
+            elif path.startswith("/v1beta/models"):
+                models = [
                     {"name": f"models/{n}", "displayName": n, "description": c["desc"],
                      "supportedGenerationMethods": ["generateContent", "streamGenerateContent"]}
                     for n, c in MODELS.items()
-                ]})
-            elif self.path == "/":
+                ]
+                self.send_json({"models": models})
+            elif path in ("", "/", "/api/hello", "/health"):
                 self.send_json({"status": "ok", "version": __version__, "models": list(MODELS.keys())})
             else:
                 self.send_json({"error": "not found"}, 404)
         except (BrokenPipeError, ConnectionResetError):
             pass
+        except Exception as e:
+            log(f"GET error: {e}")
 
     def do_POST(self):
         try:
-            if self.path.startswith("/v1") and not self._authorized():
+            path = self.path.split("?")[0].rstrip("/")
+            if (path.startswith("/v1") or path.startswith("/messages") or path.startswith("/chat") or path.startswith("/responses")) and not self._authorized():
                 self.send_json({"error": {"message": "invalid api key"}}, 401)
                 return
             body = self._read_request_body()
-            if self.path == "/v1/chat/completions":
+            if path in ("/v1/chat/completions", "/chat/completions", "/v1/v1/chat/completions") or path.endswith("/chat/completions"):
                 self._handle_chat(body)
-            elif self.path == "/v1/responses":
+            elif path in ("/v1/responses", "/responses", "/v1/v1/responses") or path.endswith("/responses"):
                 self._handle_responses(body)
-            elif ":streamGenerateContent" in self.path:
+            elif path in ("/v1/messages/count_tokens", "/messages/count_tokens", "/v1/v1/messages/count_tokens") or path.endswith("/messages/count_tokens"):
+                self._handle_count_tokens(body)
+            elif path in ("/v1/messages", "/messages", "/v1/v1/messages") or (path.endswith("/messages") and not path.endswith("/count_tokens")):
+                self._handle_messages(body)
+            elif ":streamGenerateContent" in path:
                 self._handle_google_generate(body, stream=True)
-            elif ":generateContent" in self.path:
+            elif ":generateContent" in path:
                 self._handle_google_generate(body, stream=False)
             else:
                 self.send_json({"error": "not found"}, 404)
@@ -168,7 +197,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             log(f"POST error: {e}")
             try:
                 self.send_json({"error": {"message": str(e)}}, 500)
-            except:
+            except Exception:
                 pass
 
     # ─── /v1/chat/completions ─────────────────────────────────────────────────
@@ -286,7 +315,20 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 if isinstance(item, str):
                     messages.append({"role": "user", "content": item})
                 elif isinstance(item, dict):
-                    if item.get("type") == "function_call_output":
+                    if item.get("type") == "function_call":
+                        messages.append({
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [{
+                                "id": item.get("call_id", item.get("id", "call_0")),
+                                "type": "function",
+                                "function": {
+                                    "name": item.get("name", ""),
+                                    "arguments": item.get("arguments", "{}"),
+                                },
+                            }],
+                        })
+                    elif item.get("type") == "function_call_output":
                         messages.append({"role": "tool", "tool_call_id": item.get("call_id", ""),
                                          "name": item.get("name", ""), "content": item.get("output", "")})
                     elif item.get("type") in ("input_text", "input_image", "image"):
@@ -306,7 +348,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
                         m = {"role": "assistant", "content": text_acc or None}
                         if tc_list:
                             m["tool_calls"] = [{"id": tc.get("call_id", f"call_{i}"), "type": "function",
-                                                "function": {"name": tc.get("name",""), "arguments": tc.get("arguments","{}")}}
+                                                "function": {"name": tc.get("name", ""), "arguments": tc.get("arguments", "{}")}}
                                                for i, tc in enumerate(tc_list)]
                         messages.append(m)
                     else:
@@ -484,6 +526,188 @@ class GeminiHandler(BaseHTTPRequestHandler):
             self.send_json({"id": rid, "object": "response", "created_at": int(time.time()), "status": "completed",
                             "model": model_name, "output": output,
                             "usage": {"input_tokens": len(prompt)//4, "output_tokens": len(text or "")//4, "total_tokens": (len(prompt)+len(text or ""))//4}})
+
+    # ─── Anthropic Messages API (Claude Code compatible) ─────────────────────
+
+    def _handle_count_tokens(self, body: bytes):
+        try:
+            req = json.loads(body)
+            prompt, _ = anthropic_to_prompt(req)
+            tokens = max(1, len(prompt) // 4)
+            self.send_json({"input_tokens": tokens})
+        except Exception:
+            self.send_json({"input_tokens": 100})
+
+    def _handle_messages(self, body: bytes):
+        req = self._parse_body(body)
+        if req is None:
+            self.send_json({"type": "error", "error": {"type": "invalid_request_error", "message": "invalid JSON"}}, 400)
+            return
+
+        raw_model = req.get("model", CONFIG.get("default_model", "gemini-3.6-flash"))
+        model_name, model_id, think_mode, err, extra_fields = resolve_model(raw_model)
+        if err:
+            model_name, model_id, think_mode, _, extra_fields = resolve_model(CONFIG.get("default_model", "gemini-3.6-flash"))
+
+        tools = req.get("tools")
+        prompt, images = anthropic_to_prompt(req)
+        if not prompt.strip():
+            self.send_json({"type": "error", "error": {"type": "invalid_request_error", "message": "empty prompt"}}, 400)
+            return
+
+        stream = req.get("stream", False)
+        msg_id = f"msg_{uuid.uuid4().hex[:24]}"
+        try:
+            file_refs = _upload_images(images)
+        except RuntimeError as e:
+            self.send_json({"type": "error", "error": {"type": "api_error", "message": f"upstream error: {e}"}}, 502)
+            return
+
+        input_tokens = max(1, len(prompt) // 4)
+
+        if stream and not tools:
+            try:
+                self._start_sse(extra_headers={"anthropic-version": "2023-06-01"})
+                start_evt = {
+                    "type": "message_start",
+                    "message": {
+                        "id": msg_id,
+                        "type": "message",
+                        "role": "assistant",
+                        "model": raw_model,
+                        "content": [],
+                        "stop_reason": None,
+                        "stop_sequence": None,
+                        "usage": {"input_tokens": input_tokens, "output_tokens": 1},
+                    },
+                }
+                self.wfile.write(f"event: message_start\ndata: {json.dumps(start_evt)}\n\n".encode())
+
+                block_start = {
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {"type": "text", "text": ""},
+                }
+                self.wfile.write(f"event: content_block_start\ndata: {json.dumps(block_start)}\n\n".encode())
+                self.wfile.flush()
+
+                output_tokens = 0
+                for delta_text in generate_stream(prompt, model_id, think_mode, file_refs, extra_fields):
+                    output_tokens += max(1, len(delta_text) // 4)
+                    chunk = {
+                        "type": "content_block_delta",
+                        "index": 0,
+                        "delta": {"type": "text_delta", "text": delta_text},
+                    }
+                    self.wfile.write(f"event: content_block_delta\ndata: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
+                    self.wfile.flush()
+
+                block_stop = {"type": "content_block_stop", "index": 0}
+                self.wfile.write(f"event: content_block_stop\ndata: {json.dumps(block_stop)}\n\n".encode())
+
+                msg_delta = {
+                    "type": "message_delta",
+                    "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                    "usage": {"output_tokens": max(1, output_tokens)},
+                }
+                self.wfile.write(f"event: message_delta\ndata: {json.dumps(msg_delta)}\n\n".encode())
+                self.wfile.write(b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            except Exception as e:
+                log(f"Anthropic stream error: {e}")
+            return
+
+        try:
+            text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
+        except Exception as e:
+            self.send_json({"type": "error", "error": {"type": "api_error", "message": f"upstream error: {e}"}}, 502)
+            return
+
+        tool_calls = None
+        if tools and text:
+            text, tool_calls = parse_tool_calls(text)
+
+        content_blocks = []
+        if text:
+            content_blocks.append({"type": "text", "text": text})
+
+        if tool_calls:
+            for tc in tool_calls:
+                fn = tc.get("function", {})
+                tool_name = fn.get("name", "")
+                try:
+                    tool_args = json.loads(fn.get("arguments", "{}"))
+                except Exception:
+                    tool_args = {}
+                call_id = tc.get("id", f"toolu_{uuid.uuid4().hex[:16]}")
+                if not call_id.startswith("toolu_"):
+                    call_id = f"toolu_{call_id.replace('call_', '')}"
+                content_blocks.append({
+                    "type": "tool_use",
+                    "id": call_id,
+                    "name": tool_name,
+                    "input": tool_args,
+                })
+
+        stop_reason = "tool_use" if tool_calls else "end_turn"
+        output_tokens = max(1, len(text or "") // 4 + len(tool_calls or []) * 20)
+
+        if stream:
+            try:
+                self._start_sse(extra_headers={"anthropic-version": "2023-06-01"})
+                start_evt = {
+                    "type": "message_start",
+                    "message": {
+                        "id": msg_id,
+                        "type": "message",
+                        "role": "assistant",
+                        "model": raw_model,
+                        "content": [],
+                        "stop_reason": None,
+                        "stop_sequence": None,
+                        "usage": {"input_tokens": input_tokens, "output_tokens": 1},
+                    },
+                }
+                self.wfile.write(f"event: message_start\ndata: {json.dumps(start_evt)}\n\n".encode())
+
+                for idx, blk in enumerate(content_blocks):
+                    if blk["type"] == "text":
+                        self.wfile.write(f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': idx, 'content_block': {'type': 'text', 'text': ''}})}\n\n".encode())
+                        self.wfile.write(f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': idx, 'delta': {'type': 'text_delta', 'text': blk['text']}}, ensure_ascii=False)}\n\n".encode())
+                        self.wfile.write(f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': idx})}\n\n".encode())
+                    elif blk["type"] == "tool_use":
+                        self.wfile.write(f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': idx, 'content_block': {'type': 'tool_use', 'id': blk['id'], 'name': blk['name'], 'input': {}}})}\n\n".encode())
+                        self.wfile.write(f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': idx, 'delta': {'type': 'input_json_delta', 'partial_json': json.dumps(blk['input'], ensure_ascii=False)}}, ensure_ascii=False)}\n\n".encode())
+                        self.wfile.write(f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': idx})}\n\n".encode())
+
+                msg_delta = {
+                    "type": "message_delta",
+                    "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+                    "usage": {"output_tokens": output_tokens},
+                }
+                self.wfile.write(f"event: message_delta\ndata: {json.dumps(msg_delta)}\n\n".encode())
+                self.wfile.write(b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            except Exception as e:
+                log(f"Anthropic stream error: {e}")
+        else:
+            self.send_json({
+                "id": msg_id,
+                "type": "message",
+                "role": "assistant",
+                "model": raw_model,
+                "content": content_blocks,
+                "stop_reason": stop_reason,
+                "stop_sequence": None,
+                "usage": {
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                },
+            })
 
     # ─── /v1beta/models (Google Gemini CLI) ──────────────────────────────────
 

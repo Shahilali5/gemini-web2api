@@ -342,3 +342,120 @@ def parse_google_function_calls(text: str) -> tuple:
         except (json.JSONDecodeError, KeyError):
             pass
     return clean, function_calls
+
+
+def anthropic_to_prompt(req: dict) -> tuple:
+    """Convert Anthropic Messages API request to (prompt_str, images_list)."""
+    parts = []
+    images = []
+
+    # System instruction
+    system = req.get("system")
+    if system:
+        if isinstance(system, list):
+            sys_text = " ".join(
+                item.get("text", "") if isinstance(item, dict) else str(item)
+                for item in system
+            ).strip()
+        else:
+            sys_text = str(system).strip()
+        if sys_text:
+            parts.append(f"[System instruction]: {sys_text}")
+
+    # Tools
+    tools = req.get("tools")
+    if tools:
+        tool_defs = []
+        for tool in tools:
+            schema = tool.get("input_schema") or tool.get("parameters") or {}
+            tool_defs.append({
+                "name": tool.get("name", ""),
+                "description": tool.get("description", ""),
+                "parameters": schema,
+            })
+        if tool_defs:
+            tools_json = json.dumps(tool_defs, indent=2)
+            if len(tools_json) > 30000:
+                slim_defs = [{"name": t["name"], "description": t["description"]} for t in tool_defs]
+                tools_json = json.dumps(slim_defs, indent=2)
+            parts.append(
+                "[System instruction]: You have access to tools. "
+                "To call a tool, respond ONLY with a tool_call block in this format:\n"
+                '```tool_call\n{"name": "func_name", "arguments": {...}}\n```\n'
+                "Only use tool_call blocks when needed.\n\n"
+                f"Available tools:\n{tools_json}"
+            )
+
+    # Messages
+    for msg in req.get("messages", []):
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+        tc_strs = []
+        text_parts = []
+
+        if isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict):
+                    text_parts.append(str(block))
+                    continue
+                btype = block.get("type", "")
+                if btype == "text":
+                    text_parts.append(block.get("text", ""))
+                elif btype == "tool_use":
+                    name = block.get("name", "")
+                    inp = block.get("input", {})
+                    tc_strs.append(
+                        f'```tool_call\n{{"name": "{name}", "arguments": {json.dumps(inp, ensure_ascii=False)}}}\n```'
+                    )
+                elif btype == "tool_result":
+                    tool_id = block.get("tool_use_id", "")
+                    res_content = block.get("content", "")
+                    if isinstance(res_content, list):
+                        res_texts = []
+                        for sub in res_content:
+                            if isinstance(sub, dict):
+                                if sub.get("type") == "text":
+                                    res_texts.append(sub.get("text", ""))
+                                elif sub.get("type") == "image":
+                                    src = sub.get("source", {})
+                                    if src.get("type") == "base64" and src.get("data"):
+                                        try:
+                                            raw = base64.b64decode(src["data"], validate=True)
+                                            images.append((raw, src.get("media_type", "image/png")))
+                                            res_texts.append("[Image attached]")
+                                        except Exception:
+                                            pass
+                            else:
+                                res_texts.append(str(sub))
+                        res_str = " ".join(res_texts)
+                    else:
+                        res_str = str(res_content)
+                    text_parts.append(f"[Tool result for {tool_id}]: {res_str}")
+                elif btype == "image":
+                    src = block.get("source", {})
+                    if src.get("type") == "base64" and src.get("data"):
+                        try:
+                            raw = base64.b64decode(src["data"], validate=True)
+                            images.append((raw, src.get("media_type", "image/png")))
+                            text_parts.append("[Image attached]")
+                        except Exception:
+                            pass
+                elif btype == "thinking":
+                    th = block.get("thinking", "")
+                    if th:
+                        text_parts.append(f"[Thinking]: {th}")
+            body_text = " ".join(t for t in text_parts if t)
+        else:
+            body_text = str(content) if content else ""
+
+        if role == "assistant":
+            msg_str = f"[Assistant]: {body_text}" if body_text else "[Assistant]"
+            if tc_strs:
+                msg_str += "\n" + "\n".join(tc_strs)
+            parts.append(msg_str)
+        elif role == "user":
+            parts.append(body_text if body_text else "")
+        else:
+            parts.append(f"[{role}]: {body_text}")
+
+    return "\n\n".join(p for p in parts if p), images
