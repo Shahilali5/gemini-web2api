@@ -199,7 +199,7 @@ def log(msg: str):
 
 def load_cookie() -> tuple:
     """Load cookie from file. Returns (cookie_str, sapisid)."""
-    cookie_file = CONFIG.get("cookie_file")
+    cookie_file = CONFIG.get("cookie_file") or next((c for c in ("cookie.txt", "cookie.json", "./cookie.txt") if os.path.exists(c)), None)
     if not cookie_file:
         return "", None
     if not os.path.exists(cookie_file):
